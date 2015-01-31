@@ -10,7 +10,6 @@ var http = require('http')
   , zlib = require('zlib')
   , helpers = require('./lib/helpers')
   , bl = require('bl')
-  , oauth = require('oauth-sign')
   , hawk = require('hawk')
   , aws = require('aws-sign2')
   , httpSignature = require('http-signature')
@@ -28,6 +27,7 @@ var http = require('http')
   , isstream = require('isstream')
   , getProxyFromURI = require('./lib/getProxyFromURI')
   , Auth = require('./lib/auth').Auth
+  , oauth = require('./lib/oauth')
 
 var safeStringify = helpers.safeStringify
   , md5 = helpers.md5
@@ -133,7 +133,33 @@ function constructProxyHeaderWhiteList(headers, proxyHeaderWhiteList) {
     }, {})
 }
 
-function construcTunnelOptions(request) {
+function getTunnelOption(self, options) {
+  // Tunnel HTTPS by default, or if a previous request in the redirect chain
+  // was tunneled.  Allow the user to override this setting.
+
+  // If self.tunnel is already set (because this is a redirect), use the
+  // existing value.
+  if (typeof self.tunnel !== 'undefined') {
+    return self.tunnel
+  }
+
+  // If options.tunnel is set (the user specified a value), use it.
+  if (typeof options.tunnel !== 'undefined') {
+    return options.tunnel
+  }
+
+  // If the destination is HTTPS, tunnel.
+  if (self.uri.protocol === 'https:') {
+    return true
+  }
+
+  // Otherwise, leave tunnel unset, because if a later request in the redirect
+  // chain is HTTPS then that request (and any subsequent ones) should be
+  // tunneled.
+  return undefined
+}
+
+function constructTunnelOptions(request) {
   var proxy = request.proxy
 
   var tunnelOptions = {
@@ -209,7 +235,6 @@ function rfc3986 (str) {
 }
 
 function Request (options) {
-  // if tunnel property of options was not given default to false
   // if given the method property in options, set property explicitMethod to true
 
   // extend the Request instance with any non-reserved properties
@@ -228,13 +253,9 @@ function Request (options) {
 
   self.readable = true
   self.writable = true
-  if (typeof options.tunnel === 'undefined') {
-    options.tunnel = false
-  }
   if (options.method) {
     self.explicitMethod = true
   }
-  self.canTunnel = options.tunnel !== false && tunnel
   self.init(options)
 }
 
@@ -263,7 +284,7 @@ Request.prototype.setupTunnel = function () {
     return false
   }
 
-  if (!self.tunnel && self.uri.protocol !== 'https:') {
+  if (!self.tunnel) {
     return false
   }
 
@@ -290,10 +311,9 @@ Request.prototype.setupTunnel = function () {
   proxyHeaderExclusiveList.forEach(self.removeHeader, self)
 
   var tunnelFn = getTunnelFn(self)
-  var tunnelOptions = construcTunnelOptions(self)
+  var tunnelOptions = constructTunnelOptions(self)
 
   self.agent = tunnelFn(tunnelOptions)
-  self.tunnel = true
   return true
 }
 
@@ -383,8 +403,7 @@ Request.prototype.init = function (options) {
     self.proxy = getProxyFromURI(self.uri)
   }
 
-  // Pass in `tunnel:true` to *always* tunnel through proxies
-  self.tunnel = !!options.tunnel
+  self.tunnel = getTunnelOption(self, options)
   if (self.proxy) {
     self.setupTunnel()
   }
@@ -1516,87 +1535,29 @@ Request.prototype.hawk = function (opts) {
 
 Request.prototype.oauth = function (_oauth) {
   var self = this
-  var form, query, contentType = '', formContentType = 'application/x-www-form-urlencoded'
 
-  if (self.hasHeader('content-type') &&
-      self.getHeader('content-type').slice(0, formContentType.length) === formContentType) {
-    contentType = formContentType
-    form = self.body
-  }
-  if (self.uri.query) {
-    query = self.uri.query
-  }
+  var result = oauth.oauth({
+    uri: self.uri,
+    method: self.method,
+    headers: self.headers,
+    body: self.body,
+    oauth: _oauth,
+    qsLib: self.qsLib
+  })
 
-  var transport = _oauth.transport_method || 'header'
-  if (transport === 'body' && (
-      self.method !== 'POST' || contentType !== formContentType)) {
-
-    throw new Error('oauth.transport_method of \'body\' requires \'POST\' ' +
-      'and content-type \'' + formContentType + '\'')
+  if (result.transport === 'header') {
+    self.setHeader('Authorization', result.oauth)
   }
-
-  delete _oauth.transport_method
-
-  var oa = {}
-  for (var i in _oauth) {
-    oa['oauth_' + i] = _oauth[i]
+  else if (result.transport === 'query') {
+    self.path += result.oauth
   }
-  if ('oauth_realm' in oa) {
-    delete oa.oauth_realm
-  }
-  if (!oa.oauth_version) {
-    oa.oauth_version = '1.0'
-  }
-  if (!oa.oauth_timestamp) {
-    oa.oauth_timestamp = Math.floor( Date.now() / 1000 ).toString()
-  }
-  if (!oa.oauth_nonce) {
-    oa.oauth_nonce = uuid().replace(/-/g, '')
-  }
-  if (!oa.oauth_signature_method) {
-    oa.oauth_signature_method = 'HMAC-SHA1'
-  }
-
-  var consumer_secret_or_private_key = oa.oauth_consumer_secret || oa.oauth_private_key
-  delete oa.oauth_consumer_secret
-  delete oa.oauth_private_key
-  var token_secret = oa.oauth_token_secret
-  delete oa.oauth_token_secret
-
-  var baseurl = self.uri.protocol + '//' + self.uri.host + self.uri.pathname
-  var params = self.qsLib.parse([].concat(query, form, self.qsLib.stringify(oa)).join('&'))
-
-  var signature = oauth.sign(
-    oa.oauth_signature_method,
-    self.method,
-    baseurl,
-    params,
-    consumer_secret_or_private_key,
-    token_secret)
-
-  var buildSortedParams = function (sep, wrap) {
-    wrap = wrap || ''
-    return Object.keys(oa).sort().map(function (i) {
-      return i + '=' + wrap + oauth.rfc3986(oa[i]) + wrap
-    }).join(sep) + sep + 'oauth_signature=' + wrap + oauth.rfc3986(signature) + wrap
-  }
-
-  if (transport === 'header') {
-    var realm = _oauth.realm ? 'realm="' + _oauth.realm + '",' : ''
-    self.setHeader('Authorization', 'OAuth ' + realm + buildSortedParams(',', '"'))
-  }
-  else if (transport === 'query') {
-    self.path += (query ? '&' : '?') + buildSortedParams('&')
-  }
-  else if (transport === 'body') {
-    self.body = (form ? form + '&' : '') + buildSortedParams('&')
-  }
-  else {
-    throw new Error('oauth.transport_method invalid')
+  else if (result.transport === 'body') {
+    self.body = result.oauth
   }
 
   return self
 }
+
 Request.prototype.jar = function (jar) {
   var self = this
   var cookies
