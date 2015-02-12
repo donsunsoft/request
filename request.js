@@ -13,7 +13,6 @@ var http = require('http')
   , hawk = require('hawk')
   , aws = require('aws-sign2')
   , httpSignature = require('http-signature')
-  , uuid = require('node-uuid')
   , mime = require('mime-types')
   , tunnel = require('tunnel-agent')
   , stringstream = require('stringstream')
@@ -23,11 +22,11 @@ var http = require('http')
   , cookies = require('./lib/cookies')
   , copy = require('./lib/copy')
   , net = require('net')
-  , CombinedStream = require('combined-stream')
-  , isstream = require('isstream')
   , getProxyFromURI = require('./lib/getProxyFromURI')
   , Auth = require('./lib/auth').Auth
-  , oauth = require('./lib/oauth')
+  , OAuth = require('./lib/oauth').OAuth
+  , Multipart = require('./lib/multipart').Multipart
+  , Redirect = require('./lib/redirect').Redirect
 
 var safeStringify = helpers.safeStringify
   , md5 = helpers.md5
@@ -38,7 +37,6 @@ var safeStringify = helpers.safeStringify
 
 
 var globalPool = {}
-  , isUrl = /^https?:/
 
 var defaultProxyHeaderWhiteList = [
   'accept',
@@ -163,17 +161,22 @@ function constructTunnelOptions(request) {
   var proxy = request.proxy
 
   var tunnelOptions = {
-    proxy: {
-      host: proxy.hostname,
-      port: +proxy.port,
-      proxyAuth: proxy.auth,
-      headers: request.proxyHeaders
+    proxy : {
+      host      : proxy.hostname,
+      port      : +proxy.port,
+      proxyAuth : proxy.auth,
+      headers   : request.proxyHeaders
     },
-    rejectUnauthorized: request.rejectUnauthorized,
-    headers: request.headers,
-    ca: request.ca,
-    cert: request.cert,
-    key: request.key
+    headers            : request.headers,
+    ca                 : request.ca,
+    cert               : request.cert,
+    key                : request.key,
+    passphrase         : request.passphrase,
+    pfx                : request.pfx,
+    ciphers            : request.ciphers,
+    rejectUnauthorized : request.rejectUnauthorized,
+    secureOptions      : request.secureOptions,
+    secureProtocol     : request.secureProtocol
   }
 
   return tunnelOptions
@@ -256,6 +259,10 @@ function Request (options) {
   if (options.method) {
     self.explicitMethod = true
   }
+  self._auth = new Auth(self)
+  self._oauth = new OAuth(self)
+  self._multipart = new Multipart(self)
+  self._redirect = new Redirect(self)
   self.init(options)
 }
 
@@ -270,50 +277,33 @@ function debug() {
 }
 
 Request.prototype.setupTunnel = function () {
-  // Set up the tunneling agent if necessary
-  // Only send the proxy whitelisted header names.
-  // Turn on tunneling for the rest of request.
-
   var self = this
 
   if (typeof self.proxy === 'string') {
     self.proxy = url.parse(self.proxy)
   }
-
-  if (!self.proxy) {
+  
+  if (!self.proxy || !self.tunnel) {
     return false
   }
 
-  if (!self.tunnel) {
-    return false
-  }
-
-  // Always include `defaultProxyHeaderExclusiveList`
-
-  if (!self.proxyHeaderExclusiveList) {
-    self.proxyHeaderExclusiveList = []
-  }
-
+  // Setup Proxy Header Exclusive List and White List
+  self.proxyHeaderExclusiveList = self.proxyHeaderExclusiveList || []
+  self.proxyHeaderWhiteList = self.proxyHeaderWhiteList || defaultProxyHeaderWhiteList
   var proxyHeaderExclusiveList = self.proxyHeaderExclusiveList.concat(defaultProxyHeaderExclusiveList)
-
-  // Treat `proxyHeaderExclusiveList` as part of `proxyHeaderWhiteList`
-
-  if (!self.proxyHeaderWhiteList) {
-    self.proxyHeaderWhiteList = defaultProxyHeaderWhiteList
-  }
-
   var proxyHeaderWhiteList = self.proxyHeaderWhiteList.concat(proxyHeaderExclusiveList)
 
-  var proxyHost = constructProxyHost(self.uri)
+  // Setup Proxy Headers and Proxy Headers Host
+  // Only send the Proxy White Listed Header names
   self.proxyHeaders = constructProxyHeaderWhiteList(self.headers, proxyHeaderWhiteList)
-  self.proxyHeaders.host = proxyHost
-
+  self.proxyHeaders.host = constructProxyHost(self.uri)
   proxyHeaderExclusiveList.forEach(self.removeHeader, self)
-
+ 
+  // Set Agent from Tunnel Data
   var tunnelFn = getTunnelFn(self)
   var tunnelOptions = constructTunnelOptions(self)
-
   self.agent = tunnelFn(tunnelOptions)
+
   return true
 }
 
@@ -425,16 +415,7 @@ Request.prototype.init = function (options) {
     return self.emit('error', new Error(message))
   }
 
-  self._redirectsFollowed = self._redirectsFollowed || 0
-  self.maxRedirects = (self.maxRedirects !== undefined) ? self.maxRedirects : 10
-  self.allowRedirect = (typeof self.followRedirect === 'function') ? self.followRedirect : function(response) {
-    return true
-  }
-  self.followRedirects = (self.followRedirect !== undefined) ? !!self.followRedirect : true
-  self.followAllRedirects = (self.followAllRedirects !== undefined) ? self.followAllRedirects : false
-  if (self.followRedirects || self.followAllRedirects) {
-    self.redirects = self.redirects || []
-  }
+  self._redirect.onRequest()
 
   self.setHost = false
   if (!self.hasHeader('host')) {
@@ -507,8 +488,6 @@ Request.prototype.init = function (options) {
   }
 
   // Auth must happen last in case signing is dependent on other headers
-  self._auth = new Auth()
-
   if (options.oauth) {
     self.oauth(options.oauth)
   }
@@ -566,7 +545,6 @@ Request.prototype.init = function (options) {
     self.json(options.json)
   }
   if (options.multipart) {
-    self.boundary = uuid()
     self.multipart(options.multipart)
   }
 
@@ -666,8 +644,8 @@ Request.prototype.init = function (options) {
       if (self._form) {
         self._form.pipe(self)
       }
-      if (self._multipart) {
-        self._multipart.pipe(self)
+      if (self._multipart && self._multipart.chunked) {
+        self._multipart.body.pipe(self)
       }
       if (self.body) {
         if (Array.isArray(self.body)) {
@@ -794,6 +772,14 @@ Request.prototype.getNewAgent = function () {
     options.cert = self.cert
   }
 
+  if (self.pfx) {
+    options.pfx = self.pfx
+  }
+
+  if (self.passphrase) {
+    options.passphrase = self.passphrase
+  }
+
   var poolKey = ''
 
   // different types of agents are in different pools
@@ -824,7 +810,17 @@ Request.prototype.getNewAgent = function () {
     }
 
     if (options.cert) {
+      if (poolKey) {
+        poolKey += ':'
+      }
       poolKey += options.cert.toString('ascii') + options.key.toString('ascii')
+    }
+
+    if (options.pfx) {
+      if (poolKey) {
+        poolKey += ':'
+      }
+      poolKey += options.pfx.toString('ascii')
     }
 
     if (options.ciphers) {
@@ -1030,98 +1026,9 @@ Request.prototype.onRequestResponse = function (response) {
     }
   }
 
-  var redirectTo = null
-  if (response.statusCode >= 300 && response.statusCode < 400 && response.caseless.has('location')) {
-    var location = response.caseless.get('location')
-    debug('redirect', location)
-
-    if (self.followAllRedirects) {
-      redirectTo = location
-    } else if (self.followRedirects) {
-      switch (self.method) {
-        case 'PATCH':
-        case 'PUT':
-        case 'POST':
-        case 'DELETE':
-          // Do not follow redirects
-          break
-        default:
-          redirectTo = location
-          break
-      }
-    }
-  } else if (response.statusCode === 401) {
-    var authHeader = self._auth.response(self.method, self.uri.path, response.headers)
-    if (authHeader) {
-      self.setHeader('authorization', authHeader)
-      redirectTo = self.uri
-    }
-  }
-
-  if (redirectTo && self.allowRedirect.call(self, response)) {
-    debug('redirect to', redirectTo)
-
-    // ignore any potential response body.  it cannot possibly be useful
-    // to us at this point.
-    if (self._paused) {
-      response.resume()
-    }
-
-    if (self._redirectsFollowed >= self.maxRedirects) {
-      self.emit('error', new Error('Exceeded maxRedirects. Probably stuck in a redirect loop ' + self.uri.href))
-      return
-    }
-    self._redirectsFollowed += 1
-
-    if (!isUrl.test(redirectTo)) {
-      redirectTo = url.resolve(self.uri.href, redirectTo)
-    }
-
-    var uriPrev = self.uri
-    self.uri = url.parse(redirectTo)
-
-    // handle the case where we change protocol from https to http or vice versa
-    if (self.uri.protocol !== uriPrev.protocol) {
-      self._updateProtocol()
-    }
-
-    self.redirects.push(
-      { statusCode : response.statusCode
-      , redirectUri: redirectTo
-      }
-    )
-    if (self.followAllRedirects && response.statusCode !== 401 && response.statusCode !== 307) {
-      self.method = 'GET'
-    }
-    // self.method = 'GET' // Force all redirects to use GET || commented out fixes #215
-    delete self.src
-    delete self.req
-    delete self.agent
-    delete self._started
-    if (response.statusCode !== 401 && response.statusCode !== 307) {
-      // Remove parameters from the previous response, unless this is the second request
-      // for a server that requires digest authentication.
-      delete self.body
-      delete self._form
-      if (self.headers) {
-        self.removeHeader('host')
-        self.removeHeader('content-type')
-        self.removeHeader('content-length')
-        if (self.uri.hostname !== self.originalHost.split(':')[0]) {
-          // Remove authorization if changing hostnames (but not if just
-          // changing ports or protocols).  This matches the behavior of curl:
-          // https://github.com/bagder/curl/blob/6beb0eee/lib/http.c#L710
-          self.removeHeader('authorization')
-        }
-      }
-    }
-
-    self.emit('redirect')
-
-    self.init()
+  if (self._redirect.onResponse(response)) {
     return // Ignore the rest of the response
   } else {
-    self._redirectsFollowed = self._redirectsFollowed || 0
     // Be a good stream and emit end when the response is finished.
     // Hack to emit end on close because of a core bug that never fires end
     response.on('close', function () {
@@ -1345,69 +1252,12 @@ Request.prototype.form = function (form) {
 Request.prototype.multipart = function (multipart) {
   var self = this
 
-  var chunked = false
-  var _multipart = multipart.data || multipart
+  self._multipart.onRequest(multipart)
 
-  if (!_multipart.forEach) {
-    throw new Error('Argument error, options.multipart.')
+  if (!self._multipart.chunked) {
+    self.body = self._multipart.body
   }
 
-  if (self.getHeader('transfer-encoding') === 'chunked') {
-    chunked = true
-  }
-  if (multipart.chunked !== undefined) {
-    chunked = multipart.chunked
-  }
-  if (!chunked) {
-    _multipart.forEach(function (part) {
-      if(typeof part.body === 'undefined') {
-        throw new Error('Body attribute missing in multipart.')
-      }
-      if (isstream(part.body)) {
-        chunked = true
-      }
-    })
-  }
-
-  if (chunked && !self.hasHeader('transfer-encoding')) {
-    self.setHeader('transfer-encoding', 'chunked')
-  }
-
-  var headerName = self.hasHeader('content-type')
-  if (!headerName || self.headers[headerName].indexOf('multipart') === -1) {
-    self.setHeader('content-type', 'multipart/related; boundary=' + self.boundary)
-  } else {
-    self.setHeader(headerName, self.headers[headerName].split(';')[0] + '; boundary=' + self.boundary)
-  }
-
-  var parts = chunked ? new CombinedStream() : []
-  function add (part) {
-    return chunked ? parts.append(part) : parts.push(new Buffer(part))
-  }
-
-  if (self.preambleCRLF) {
-    add('\r\n')
-  }
-
-  _multipart.forEach(function (part) {
-    var body = part.body
-    var preamble = '--' + self.boundary + '\r\n'
-    Object.keys(part).forEach(function (key) {
-      if (key === 'body') { return }
-      preamble += key + ': ' + part[key] + '\r\n'
-    })
-    preamble += '\r\n'
-    add(preamble)
-    add(body)
-    add('\r\n')
-  })
-  add('--' + self.boundary + '--')
-
-  if (self.postambleCRLF) {
-    add('\r\n')
-  }
-
-  self[chunked ? '_multipart' : 'body'] = parts
   return self
 }
 Request.prototype.json = function (val) {
@@ -1422,15 +1272,15 @@ Request.prototype.json = function (val) {
     if (self.body !== undefined) {
       if (!/^application\/x-www-form-urlencoded\b/.test(self.getHeader('content-type'))) {
         self.body = safeStringify(self.body)
+      } else {
+        self.body = rfc3986(self.body)
       }
-      self.body = rfc3986(self.body)
       if (!self.hasHeader('content-type')) {
         self.setHeader('content-type', 'application/json')
       }
     }
   } else {
     self.body = safeStringify(val)
-    self.body = rfc3986(self.body)
     if (!self.hasHeader('content-type')) {
       self.setHeader('content-type', 'application/json')
     }
@@ -1460,24 +1310,14 @@ Request.prototype.getHeader = function (name, headers) {
   })
   return result
 }
-var getHeader = Request.prototype.getHeader
 
 Request.prototype.auth = function (user, pass, sendImmediately, bearer) {
   var self = this
 
-  var authHeader
-  if (bearer !== undefined) {
-    authHeader = self._auth.bearer(bearer, sendImmediately)
-  } else {
-    authHeader = self._auth.basic(user, pass, sendImmediately)
-  }
-  if (authHeader) {
-    self.setHeader('authorization', authHeader)
-  }
+  self._auth.onRequest(user, pass, sendImmediately, bearer)
 
   return self
 }
-
 Request.prototype.aws = function (opts, now) {
   var self = this
 
@@ -1515,7 +1355,7 @@ Request.prototype.httpSignature = function (opts) {
   var self = this
   httpSignature.signRequest({
     getHeader: function(header) {
-      return getHeader(header, self.headers)
+      return self.getHeader(header, self.headers)
     },
     setHeader: function(header, value) {
       self.setHeader(header, value)
@@ -1527,33 +1367,14 @@ Request.prototype.httpSignature = function (opts) {
 
   return self
 }
-
 Request.prototype.hawk = function (opts) {
   var self = this
   self.setHeader('Authorization', hawk.client.header(self.uri, self.method, opts).field)
 }
-
 Request.prototype.oauth = function (_oauth) {
   var self = this
 
-  var result = oauth.oauth({
-    uri: self.uri,
-    method: self.method,
-    headers: self.headers,
-    body: self.body,
-    oauth: _oauth,
-    qsLib: self.qsLib
-  })
-
-  if (result.transport === 'header') {
-    self.setHeader('Authorization', result.oauth)
-  }
-  else if (result.transport === 'query') {
-    self.path += result.oauth
-  }
-  else if (result.transport === 'body') {
-    self.body = result.oauth
-  }
+  self._oauth.onRequest(_oauth)
 
   return self
 }
@@ -1562,7 +1383,7 @@ Request.prototype.jar = function (jar) {
   var self = this
   var cookies
 
-  if (self._redirectsFollowed === 0) {
+  if (self._redirect.redirectsFollowed === 0) {
     self.originalCookieHeader = self.getHeader('cookie')
   }
 

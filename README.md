@@ -5,6 +5,14 @@
 [![Coverage](https://img.shields.io/coveralls/request/request.svg?style=flat)](https://coveralls.io/r/request/request)
 [![Gitter](https://img.shields.io/badge/gitter-join_chat-blue.svg?style=flat)](https://gitter.im/request/request?utm_source=badge)
 
+## !!! Does not work with Node v0.12.x !!!
+
+We're working on this.  Want to help?  See the
+[contribution guidelines](https://github.com/request/request/blob/master/CONTRIBUTING.md),
+help us fix the
+[failing tests](https://travis-ci.org/request/request/jobs/49916823),
+and [submit a PR](https://github.com/request/request/pulls)!
+
 ## Super simple to use
 
 Request is designed to be the simplest way possible to make http calls. It supports HTTPS and follows redirects by default.
@@ -599,9 +607,9 @@ The first argument can be either a `url` or an `options` object. The only requir
     with your pool options or create the pool object with the `maxSockets`
     property outside of the loop.
 * `timeout` - Integer containing the number of milliseconds to wait for a
-  request to respond before aborting the request.  Note that increasing the
-  timeout beyond the OS-wide TCP connection timeout will not work
-  ([the default in Linux is around 20 seconds](http://www.sekuda.com/overriding_the_default_linux_kernel_20_second_tcp_socket_connect_timeout)).
+  request to respond before aborting the request.  Note that if the underlying
+  TCP connection cannot be established, the OS-wide TCP connection timeout will
+  overrule the `timeout` option ([the default in Linux is around 20 seconds](http://www.sekuda.com/overriding_the_default_linux_kernel_20_second_tcp_socket_connect_timeout)).
 * `proxy` - An HTTP proxy to be used. Supports proxy Auth with Basic Auth, identical to support for the `url` parameter (by embedding the auth info in the `uri`)
 * `oauth` - Options for OAuth HMAC-SHA1 signing. See documentation above.
 * `hawk` - Options for [Hawk signing](https://github.com/hueniverse/hawk). The `credentials` key must contain the necessary signing info, [see hawk docs for details](https://github.com/hueniverse/hawk#usage-example).
