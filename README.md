@@ -5,14 +5,6 @@
 [![Coverage](https://img.shields.io/coveralls/request/request.svg?style=flat)](https://coveralls.io/r/request/request)
 [![Gitter](https://img.shields.io/badge/gitter-join_chat-blue.svg?style=flat)](https://gitter.im/request/request?utm_source=badge)
 
-## !!! Does not work with Node v0.12.x !!!
-
-We're working on this.  Want to help?  See the
-[contribution guidelines](https://github.com/request/request/blob/master/CONTRIBUTING.md),
-help us fix the
-[failing tests](https://travis-ci.org/request/request/jobs/49916823),
-and [submit a PR](https://github.com/request/request/pulls)!
-
 ## Super simple to use
 
 Request is designed to be the simplest way possible to make http calls. It supports HTTPS and follows redirects by default.
@@ -572,6 +564,7 @@ request.get({
 The first argument can be either a `url` or an `options` object. The only required option is `uri`; all others are optional.
 
 * `uri` || `url` - fully qualified uri or a parsed url object from `url.parse()`
+* `baseUrl` - fully qualified uri string used as the base url. Most useful with `request.defaults`, for example when you want to do many requests to the same domain.  If `baseUrl` is `https://example.com/api/`, then requesting `/end/point?test=true` will fetch `https://example.com/api/end/point?test=true`. When `baseUrl` is given, `uri` must also be a string.
 * `qs` - object containing querystring values to be appended to the `uri`
 * `useQuerystring` - If true, use `querystring` to stringify and parse
   querystrings, otherwise use `qs` (default: `false`).  Set this option to
@@ -615,7 +608,7 @@ The first argument can be either a `url` or an `options` object. The only requir
 * `hawk` - Options for [Hawk signing](https://github.com/hueniverse/hawk). The `credentials` key must contain the necessary signing info, [see hawk docs for details](https://github.com/hueniverse/hawk#usage-example).
 * `strictSSL` - If `true`, requires SSL certificates be valid. **Note:** to use your own certificate authority, you need to specify an agent that was created with that CA as an option.
 * `agentOptions` - Object containing user agent options. See documentation above. **Note:** [see tls API doc for TLS/SSL options](http://nodejs.org/api/tls.html#tls_tls_connect_options_callback).
-
+* `time` - If `true`, the request-response cycle (including all redirects) is timed at millisecond resolution, and the result provided on the response's `elapsedTime` property.
 * `jar` - If `true` and `tough-cookie` is installed, remember cookies for future use (or define your custom cookie jar; see examples section)
 * `aws` - `object` containing AWS signing information. Should have the properties `key`, `secret`. Also requires the property `bucket`, unless you’re specifying your `bucket` as part of the path, or the request doesn’t use a bucket (i.e. GET Services)
 * `httpSignature` - Options for the [HTTP Signature Scheme](https://github.com/joyent/node-http-signature/blob/master/http_signing.md) using [Joyent's library](https://github.com/joyent/node-http-signature). The `keyId` and `key` properties must be specified. See the docs for other options.
@@ -633,6 +626,7 @@ The first argument can be either a `url` or an `options` object. The only requir
   tunneling proxy.
 * `proxyHeaderExclusiveList` - A whitelist of headers to send
   exclusively to a tunneling proxy and not to destination.
+* `removeRefererHeader` - removes the referer header when a redirect happens (default: `false`).
 
 
 The callback argument gets 3 arguments:

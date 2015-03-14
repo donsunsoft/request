@@ -282,7 +282,7 @@ Request.prototype.setupTunnel = function () {
   if (typeof self.proxy === 'string') {
     self.proxy = url.parse(self.proxy)
   }
-  
+
   if (!self.proxy || !self.tunnel) {
     return false
   }
@@ -298,7 +298,7 @@ Request.prototype.setupTunnel = function () {
   self.proxyHeaders = constructProxyHeaderWhiteList(self.headers, proxyHeaderWhiteList)
   self.proxyHeaders.host = constructProxyHost(self.uri)
   proxyHeaderExclusiveList.forEach(self.removeHeader, self)
- 
+
   // Set Agent from Tunnel Data
   var tunnelFn = getTunnelFn(self)
   var tunnelOptions = constructTunnelOptions(self)
@@ -322,7 +322,9 @@ Request.prototype.init = function (options) {
   if (!self.method) {
     self.method = options.method || 'GET'
   }
-  self.localAddress = options.localAddress
+  if (!self.localAddress) {
+    self.localAddress = options.localAddress
+  }
 
   if (!self.qsLib) {
     self.qsLib = (options.useQuerystring ? querystring : qs)
@@ -353,6 +355,37 @@ Request.prototype.init = function (options) {
   if (!self.uri && self.url) {
     self.uri = self.url
     delete self.url
+  }
+
+  // If there's a baseUrl, then use it as the base URL (i.e. uri must be
+  // specified as a relative path and is appended to baseUrl).
+  if (self.baseUrl) {
+    if (typeof self.baseUrl !== 'string') {
+      return self.emit('error', new Error('options.baseUrl must be a string'))
+    }
+
+    if (typeof self.uri !== 'string') {
+      return self.emit('error', new Error('options.uri must be a string when using options.baseUrl'))
+    }
+
+    if (self.uri.indexOf('//') === 0 || self.uri.indexOf('://') !== -1) {
+      return self.emit('error', new Error('options.uri must be a path when using options.baseUrl'))
+    }
+
+    // Handle all cases to make sure that there's only one slash between
+    // baseUrl and uri.
+    var baseUrlEndsWithSlash = self.baseUrl.lastIndexOf('/') === self.baseUrl.length - 1
+    var uriStartsWithSlash = self.uri.indexOf('/') === 0
+
+    if (baseUrlEndsWithSlash && uriStartsWithSlash) {
+      self.uri = self.baseUrl + self.uri.slice(1)
+    } else if (baseUrlEndsWithSlash || uriStartsWithSlash) {
+      self.uri = self.baseUrl + self.uri
+    } else if (self.uri === '') {
+      self.uri = self.baseUrl
+    } else {
+      self.uri = self.baseUrl + '/' + self.uri
+    }
   }
 
   // A URI is needed by this point, throw if we haven't been able to get one
@@ -546,6 +579,11 @@ Request.prototype.init = function (options) {
   }
   if (options.multipart) {
     self.multipart(options.multipart)
+  }
+
+  if (options.time) {
+    self.timing = true
+    self.elapsedTime = self.elapsedTime || 0
   }
 
   if (self.body) {
@@ -891,20 +929,26 @@ Request.prototype.start = function () {
   delete reqOptions.auth
 
   debug('make request', self.uri.href)
+
   self.req = self.httpModule.request(reqOptions)
 
+  if (self.timing) {
+    self.startTime = new Date().getTime()
+  }
+
   if (self.timeout && !self.timeoutTimer) {
+    var timeout = self.timeout < 0 ? 0 : self.timeout
     self.timeoutTimer = setTimeout(function () {
       self.abort()
       var e = new Error('ETIMEDOUT')
       e.code = 'ETIMEDOUT'
       self.emit('error', e)
-    }, self.timeout)
+    }, timeout)
 
     // Set additional timeout on socket - in case if remote
     // server freeze after sending headers
     if (self.req.setTimeout) { // only works on node 0.6+
-      self.req.setTimeout(self.timeout, function () {
+      self.req.setTimeout(timeout, function () {
         if (self.req) {
           self.req.abort()
           var e = new Error('ESOCKETTIMEDOUT')
@@ -955,6 +999,11 @@ Request.prototype.onRequestResponse = function (response) {
   var self = this
   debug('onRequestResponse', self.uri.href, response.statusCode, response.headers)
   response.on('end', function() {
+    if (self.timing) {
+      self.elapsedTime += (new Date().getTime() - self.startTime)
+      debug('elapsed time', self.elapsedTime)
+      response.elapsedTime = self.elapsedTime
+    }
     debug('response end', self.uri.href, response.statusCode, response.headers)
   })
 
